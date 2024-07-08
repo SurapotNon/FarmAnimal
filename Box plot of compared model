@@ -1,0 +1,125 @@
+# Load necessary libraries
+library(lme4)
+library(geepack)
+library(nlme)
+library(reshape2)
+library(ggplot2)
+
+# Function to drop unused factor levels
+drop_unused_levels <- function(df) {
+  df[] <- lapply(df, function(x) if (is.factor(x)) factor(x) else x)
+  return(df)
+}
+
+# Perform cross-validation
+set.seed(132)  # For reproducibility
+
+# Number of iterations for cross-validation
+iterations <- 100
+
+# Initialize a matrix to store the performance metrics for each model
+performance_metrics <- matrix(NA, nrow = iterations, ncol = 5)
+colnames(performance_metrics) <- c("HLM", "LMM", "GCM", "GEE", "AR")
+
+# Control parameters for lmer
+lmer_control <- lmerControl(optCtrl = list(maxfun = 20000), check.conv.grad = .makeCC("warning", tol = 0.002))
+
+# Perform cross-validation
+for (iteration in 1:iterations) {
+  # Split data 80/20 without replacement
+  set.seed(iteration)
+  idx <- sample(seq_len(nrow(combined_lamb_removemissing)), size = 0.8 * nrow(combined_lamb_removemissing))
+  train_data <- combined_lamb_removemissing[idx, ]
+  test_data <- combined_lamb_removemissing[-idx, ]
+  
+  # Drop unused levels in factors for both training and test data
+  train_data <- drop_unused_levels(train_data)
+  test_data <- drop_unused_levels(test_data)
+  
+  # Fit the HLM model
+  fit_hlm <- lmer(Weight ~ AgeMonths + Sex + Sire + type + BirthType + DW + DurationBeforeSlaughter + MotherAgeOnBornDate + (1 | No.), 
+                  data = train_data, control = lmer_control)
+  predictions_hlm <- tryCatch({
+    predict(fit_hlm, newdata = test_data, allow.new.levels = TRUE)
+  }, error = function(e) rep(NA, nrow(test_data)))
+  mse_hlm <- mean((test_data$Weight - predictions_hlm)^2, na.rm = TRUE)
+  performance_metrics[iteration, "HLM"] <- mse_hlm
+  
+  # Fit the LMM model
+  fit_lmm <- lmer(Weight ~ AgeMonths + Sex + Sire + type + BirthType + DW + DurationBeforeSlaughter + MotherAgeOnBornDate + (1 + AgeMonths | No.), 
+                  data = train_data, control = lmer_control)
+  predictions_lmm <- tryCatch({
+    predict(fit_lmm, newdata = test_data, allow.new.levels = TRUE)
+  }, error = function(e) rep(NA, nrow(test_data)))
+  mse_lmm <- mean((test_data$Weight - predictions_lmm)^2, na.rm = TRUE)
+  performance_metrics[iteration, "LMM"] <- mse_lmm
+  
+  # Fit the GCM model
+  fit_gcm_poly3 <- lmer(Weight ~ AgeMonths + Sex + Sire + type + BirthType + DW + DurationBeforeSlaughter + MotherAgeOnBornDate + poly(AgeMonths, 2) + (AgeMonths | No.), 
+                        data = train_data, control = lmer_control)
+  predictions_gcm_poly3 <- tryCatch({
+    predict(fit_gcm_poly3, newdata = test_data, allow.new.levels = TRUE)
+  }, error = function(e) rep(NA, nrow(test_data)))
+  mse_gcm_poly3 <- mean((test_data$Weight - predictions_gcm_poly3)^2, na.rm = TRUE)
+  performance_metrics[iteration, "GCM"] <- mse_gcm_poly3
+  
+  # Fit the GEE model
+  gee_model <- geeglm(Weight ~ AgeMonths + Sex + type + BirthType + DW + DurationBeforeSlaughter + MotherAgeOnBornDate, 
+                      id = No., 
+                      data = train_data, 
+                      family = gaussian(), 
+                      corstr = "exchangeable")
+  predictions_gee <- tryCatch({
+    predict(gee_model, newdata = test_data, type = "response")
+  }, error = function(e) rep(NA, nrow(test_data)))
+  mse_gee <- mean((test_data$Weight - predictions_gee)^2, na.rm = TRUE)
+  performance_metrics[iteration, "GEE"] <- mse_gee
+  
+  # Fit the AR model
+  fit_ar3 <- lme(
+    Weight ~ AgeMonths + Sex + Sire + type + BirthType + DW + DurationBeforeSlaughter + MotherAgeOnBornDate, 
+    random = ~ 1 | No., 
+    correlation = corAR1(form = ~ AgeMonths | No.), 
+    data = train_data
+  )
+  predictions_ar3 <- tryCatch({
+    predict(fit_ar3, newdata = test_data, level = 0)
+  }, error = function(e) rep(NA, nrow(test_data)))
+  mse_ar3 <- mean((test_data$Weight - predictions_ar3)^2, na.rm = TRUE)
+  performance_metrics[iteration, "AR"] <- mse_ar3
+}
+
+# Convert the performance metrics to a data frame for plotting
+performance_metrics_df <- as.data.frame(performance_metrics)
+
+# Map short names to full names for better presentation
+model_names <- c("HLM" = "Hierarchical Linear Model", 
+                 "LMM" = "Linear Mixed-Effects Model", 
+                 "GCM" = "Growth Curve Model", 
+                 "GEE" = "Generalized Estimating Equations Model", 
+                 "AR" = "Linear Mixed Effects Model with AR(1) Correlation Structure")
+
+# Reshape the data frame for plotting
+performance_metrics_long <- melt(performance_metrics_df, variable.name = "Model", value.name = "MSE")
+performance_metrics_long$Model <- model_names[performance_metrics_long$Model]
+performance_metrics_long$Iteration <- rep(1:iterations, times = 5)
+
+# Filter out NA values
+performance_metrics_long <- na.omit(performance_metrics_long)
+
+# Boxplot with different colors for each model and larger legend text
+ggplot(performance_metrics_long, aes(x = Model, y = MSE, fill = Model)) +
+  geom_boxplot(color = "darkblue") +
+  labs(title = "Model Performance Comparison", x = "Model", y = "Mean Squared Error (MSE)") +
+  theme_minimal(base_size = 15) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15)) +
+  scale_fill_manual(values = c("Hierarchical Linear Model" = "skyblue", 
+                               "Linear Mixed-Effects Model" = "lightgreen", 
+                               "Growth Curve Model" = "lightpink", 
+                               "Generalized Estimating Equations Model" = "lightyellow", 
+                               "Linear Mixed Effects Model with AR(1) Correlation Structure" = "lightcoral"))
